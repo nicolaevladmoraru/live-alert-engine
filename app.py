@@ -15,15 +15,11 @@ DATA_DIR = os.getenv("DATA_DIR", "/data").strip() or "/data"
 LEAGUE_CACHE_FILE = os.path.join(DATA_DIR, "league_cache.json")
 SENT_ALERTS_FILE = os.path.join(DATA_DIR, "sent_alerts.json")
 
-LEAGUE_CACHE_TTL_SEC = 24 * 60 * 60  # 24h
-STATS_COOLDOWN_SEC = 60  # 1 minute cooldown (relevant windows only)
+LEAGUE_CACHE_TTL_SEC = 24 * 60 * 60
+STATS_COOLDOWN_SEC = 60
 
-# Stats cache: fixture_id -> {"home": int, "away": int, "ts": float}
 STATS_CACHE = {}
-
-# In-memory + persisted anti-duplicate: fixture_id|alert_code
 SENT_ALERTS = set()
-
 
 ALLOWED_LEAGUE_KEYS = [
     ("Egypt", "Premier League"),
@@ -270,6 +266,30 @@ def resolve_allowed_league_ids():
         return allowed_ids
 
 
+def build_premium_message(alert_title: str, league_name: str, country: str, home: str, away: str,
+                         minute: int, status_short: str, score: str, sot_home: int, sot_away: int,
+                         pick_text: str) -> str:
+    header = alert_title
+    comp = f"🏆 {league_name}" if league_name else "🏆 League"
+    if country:
+        comp = f"🏆 {country} - {league_name}" if league_name else f"🏆 {country}"
+
+    timing = f"⏱ Minute: {minute}" if minute >= 0 else f"⏱ Status: {status_short}"
+    if status_short == "HT":
+        timing = "⏱ Status: HT"
+
+    msg = (
+        f"{header}\n\n"
+        f"{comp}\n"
+        f"{home} vs {away}\n\n"
+        f"{timing}\n"
+        f"📌 Score: {score}\n"
+        f"🎯 Shots on Target: {sot_home}-{sot_away}\n\n"
+        f"📊 Pick:\n{pick_text}"
+    )
+    return msg
+
+
 def check_alerts_for_match(match: dict, allowed_league_ids: set):
     fixture = match.get("fixture", {}) or {}
     league = match.get("league", {}) or {}
@@ -298,76 +318,134 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
     away_goals = _safe_int(goals.get("away"), 0)
     score = f"{home_goals} - {away_goals}"
 
+    league_name = (league.get("name") or "").strip()
+    country = (league.get("country") or "").strip()
+
     home_sot, away_sot = get_sot_cached(fixture_id)
     sot_total = home_sot + away_sot
 
+    # Alert 1: GOAL 1H -> Pick: Over 0.5 goals (1st Half)
     if 20 <= minute <= 30 and score == "0 - 0" and sot_total >= 3:
         if not already_sent(fixture_id, "GOAL_1H"):
-            msg = (
-                f"🟢 GOAL 1H\n"
-                f"{home_name} vs {away_name}\n"
-                f"Minute: {minute}\n"
-                f"SOT: {home_sot} - {away_sot}"
+            msg = build_premium_message(
+                alert_title="🟢 GOAL 1H",
+                league_name=league_name,
+                country=country,
+                home=home_name,
+                away=away_name,
+                minute=minute,
+                status_short=status_short,
+                score=score,
+                sot_home=home_sot,
+                sot_away=away_sot,
+                pick_text="Over 0.5 goals (1st Half)"
             )
             send_telegram(msg)
 
+    # Alert 2: 2 GOALS 2H (HT) -> Pick: Over 1.5 goals (2nd Half)
     if status_short == "HT" and score == "0 - 0" and sot_total >= 5:
         if not already_sent(fixture_id, "TWO_GOALS_2H"):
-            msg = (
-                f"🟡 2 GOALS 2H\n"
-                f"{home_name} vs {away_name}\n"
-                f"Status: HT\n"
-                f"SOT: {home_sot} - {away_sot}"
+            msg = build_premium_message(
+                alert_title="🟡 2 GOALS 2H",
+                league_name=league_name,
+                country=country,
+                home=home_name,
+                away=away_name,
+                minute=minute,
+                status_short=status_short,
+                score=score,
+                sot_home=home_sot,
+                sot_away=away_sot,
+                pick_text="Over 1.5 goals (2nd Half)"
             )
             send_telegram(msg)
 
+    # Alert 3: OVER 2.5 GOALS (HT) -> Pick: Over 2.5 goals (Full Time)
     if status_short == "HT" and score in ("1 - 0", "0 - 1") and sot_total >= 4:
         if not already_sent(fixture_id, "OVER_2_5_GOALS"):
-            msg = (
-                f"🔵 OVER 2.5 GOALS\n"
-                f"{home_name} vs {away_name}\n"
-                f"Status: HT\n"
-                f"SOT: {home_sot} - {away_sot}"
+            msg = build_premium_message(
+                alert_title="🔵 OVER 2.5 GOALS",
+                league_name=league_name,
+                country=country,
+                home=home_name,
+                away=away_name,
+                minute=minute,
+                status_short=status_short,
+                score=score,
+                sot_home=home_sot,
+                sot_away=away_sot,
+                pick_text="Over 2.5 goals (Full Time)"
             )
             send_telegram(msg)
 
+    # Alert 4: GOAL PUSH 2H -> Pick: Over 0.5 goals (2nd Half)
     if 50 <= minute <= 70 and score == "1 - 1" and sot_total >= 6:
         if not already_sent(fixture_id, "GOAL_PUSH_2H"):
-            msg = (
-                f"🟠 GOAL PUSH 2H\n"
-                f"{home_name} vs {away_name}\n"
-                f"Minute: {minute}\n"
-                f"SOT: {home_sot} - {away_sot}"
+            msg = build_premium_message(
+                alert_title="🟠 GOAL PUSH 2H",
+                league_name=league_name,
+                country=country,
+                home=home_name,
+                away=away_name,
+                minute=minute,
+                status_short=status_short,
+                score=score,
+                sot_home=home_sot,
+                sot_away=away_sot,
+                pick_text="Over 0.5 goals (2nd Half)"
             )
             send_telegram(msg)
 
+    # Alert 5: LATE GOAL -> Pick: 1 more goal
     if 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
         if not already_sent(fixture_id, "LATE_GOAL"):
-            msg = (
-                f"🔴 LATE GOAL\n"
-                f"{home_name} vs {away_name}\n"
-                f"Minute: {minute}\n"
-                f"SOT: {home_sot} - {away_sot}"
+            msg = build_premium_message(
+                alert_title="🔴 LATE GOAL",
+                league_name=league_name,
+                country=country,
+                home=home_name,
+                away=away_name,
+                minute=minute,
+                status_short=status_short,
+                score=score,
+                sot_home=home_sot,
+                sot_away=away_sot,
+                pick_text="1 more goal"
             )
             send_telegram(msg)
 
+    # Alert 6: LAST MINUTE GOAL -> Pick: Goal (Last Minutes)
     if 85 <= minute <= 88 and sot_total >= 10:
         if not already_sent(fixture_id, "LAST_MINUTE_GOAL"):
-            msg = (
-                f"🟣 LAST MINUTE GOAL\n"
-                f"{home_name} vs {away_name}\n"
-                f"Minute: {minute}\n"
-                f"SOT: {home_sot} - {away_sot}"
+            msg = build_premium_message(
+                alert_title="🟣 LAST MINUTE GOAL",
+                league_name=league_name,
+                country=country,
+                home=home_name,
+                away=away_name,
+                minute=minute,
+                status_short=status_short,
+                score=score,
+                sot_home=home_sot,
+                sot_away=away_sot,
+                pick_text="Goal (Last Minutes)"
             )
             send_telegram(msg)
 
 
 def main():
     ensure_data_dir()
-    print("Live Alert Engine v4 Started (Disk cache + persistent anti-duplicate)")
+    print("Live Alert Engine v5 Started (Premium Telegram format)")
     validate_env()
 
-    load_sent_alerts()
+    payload = load_json_file(SENT_ALERTS_FILE)
+    if isinstance(payload, list):
+        global SENT_ALERTS
+        SENT_ALERTS = set(str(x) for x in payload)
+        print(f"Loaded {len(SENT_ALERTS)} sent alerts from disk.")
+    else:
+        print("No sent alerts file found; starting fresh.")
+
     allowed_league_ids = resolve_allowed_league_ids()
     print(f"Allowed league IDs active: {len(allowed_league_ids)}")
 
