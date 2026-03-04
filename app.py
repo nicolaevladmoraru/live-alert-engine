@@ -7,10 +7,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 API_BASE = "https://v3.football.api-sports.io"
-
-HEADERS = {
-    "x-apisports-key": API_KEY
-}
+HEADERS = {"x-apisports-key": API_KEY}
 
 ALLOWED_LEAGUES = {
     39,   # England - Premier League
@@ -46,28 +43,44 @@ ALLOWED_LEAGUES = {
 
 SENT_ALERTS = set()
 
+# Stats cache: fixture_id -> {"home": int, "away": int, "ts": float}
+STATS_CACHE = {}
 
-def _safe_int(value, default=0):
+# Cooldown for stats per fixture (seconds)
+STATS_COOLDOWN_SEC = 60
+
+
+def _safe_int(v, default=0):
     try:
-        if value is None:
+        if v is None:
             return default
-        return int(value)
+        return int(v)
     except Exception:
         return default
 
 
-def send_telegram(message: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram variables missing (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID).")
-        return False
+def validate_env():
+    missing = []
+    if not API_KEY:
+        missing.append("API_FOOTBALL_KEY")
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
 
+    if missing:
+        print("Missing environment variables: " + ", ".join(missing))
+    else:
+        print("All required environment variables are set.")
+
+
+def send_telegram(message: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "disable_web_page_preview": True
     }
-
     try:
         resp = requests.post(url, data=payload, timeout=15)
         ok = (resp.status_code == 200)
@@ -80,10 +93,6 @@ def send_telegram(message: str) -> bool:
 
 
 def get_live_fixtures():
-    if not API_KEY:
-        print("API_FOOTBALL_KEY is missing.")
-        return []
-
     url = f"{API_BASE}/fixtures?live=all"
     try:
         r = requests.get(url, headers=HEADERS, timeout=25)
@@ -94,27 +103,59 @@ def get_live_fixtures():
         return []
 
 
-def get_shots_on_target(fixture_id: int):
+def should_fetch_stats(minute: int, status_short: str) -> bool:
+    # Fetch stats only when the match is in a relevant window or at HT.
+    if status_short == "HT":
+        return True
+    if minute < 0:
+        return False
+
+    if 20 <= minute <= 30:
+        return True
+    if 50 <= minute <= 70:
+        return True
+    if 70 <= minute <= 85:
+        return True
+    if 85 <= minute <= 88:
+        return True
+
+    return False
+
+
+def get_sot_cached(fixture_id: int):
+    now = time.time()
+    cached = STATS_CACHE.get(fixture_id)
+
+    if cached and (now - cached["ts"] < STATS_COOLDOWN_SEC):
+        return cached["home"], cached["away"]
+
     url = f"{API_BASE}/fixtures/statistics?fixture={fixture_id}"
+
     try:
         r = requests.get(url, headers=HEADERS, timeout=25)
         data = r.json()
         resp = data.get("response", [])
 
         if not isinstance(resp, list) or len(resp) < 2:
-            return 0, 0
+            home_sot, away_sot = 0, 0
+        else:
+            def extract_sot(team_block):
+                for item in team_block.get("statistics", []):
+                    if item.get("type") == "Shots on Target":
+                        return _safe_int(item.get("value"), 0)
+                return 0
 
-        def extract_sot(team_block):
-            for item in team_block.get("statistics", []):
-                if item.get("type") == "Shots on Target":
-                    return _safe_int(item.get("value"), 0)
-            return 0
+            home_sot = extract_sot(resp[0])
+            away_sot = extract_sot(resp[1])
 
-        home_sot = extract_sot(resp[0])
-        away_sot = extract_sot(resp[1])
+        STATS_CACHE[fixture_id] = {"home": home_sot, "away": away_sot, "ts": now}
         return home_sot, away_sot
 
-    except Exception:
+    except Exception as ex:
+        # If the API fails, return cached values if available; otherwise zeros.
+        if cached:
+            return cached["home"], cached["away"]
+        print(f"Stats request failed for fixture {fixture_id}: {ex}")
         return 0, 0
 
 
@@ -127,10 +168,10 @@ def already_sent(fixture_id: int, alert_code: str) -> bool:
 
 
 def check_alerts_for_match(match: dict):
-    fixture = match.get("fixture", {})
-    league = match.get("league", {})
-    teams = match.get("teams", {})
-    goals = match.get("goals", {})
+    fixture = match.get("fixture", {}) or {}
+    league = match.get("league", {}) or {}
+    teams = match.get("teams", {}) or {}
+    goals = match.get("goals", {}) or {}
 
     fixture_id = _safe_int(fixture.get("id"), 0)
     if fixture_id <= 0:
@@ -145,6 +186,10 @@ def check_alerts_for_match(match: dict):
 
     minute = _safe_int(status.get("elapsed"), -1)
 
+    # Skip matches that are not in relevant windows and not HT.
+    if not should_fetch_stats(minute, status_short):
+        return
+
     home_name = (teams.get("home", {}) or {}).get("name", "Home")
     away_name = (teams.get("away", {}) or {}).get("name", "Away")
 
@@ -152,11 +197,11 @@ def check_alerts_for_match(match: dict):
     away_goals = _safe_int(goals.get("away"), 0)
     score = f"{home_goals} - {away_goals}"
 
-    home_sot, away_sot = get_shots_on_target(fixture_id)
+    home_sot, away_sot = get_sot_cached(fixture_id)
     sot_total = home_sot + away_sot
 
     # Alert 1: GOAL 1H
-    if minute != -1 and 20 <= minute <= 30 and score == "0 - 0" and sot_total >= 3:
+    if 20 <= minute <= 30 and score == "0 - 0" and sot_total >= 3:
         if not already_sent(fixture_id, "GOAL_1H"):
             msg = (
                 f"🟢 GOAL 1H\n"
@@ -189,7 +234,7 @@ def check_alerts_for_match(match: dict):
             send_telegram(msg)
 
     # Alert 4: GOAL PUSH 2H
-    if minute != -1 and 50 <= minute <= 70 and score == "1 - 1" and sot_total >= 6:
+    if 50 <= minute <= 70 and score == "1 - 1" and sot_total >= 6:
         if not already_sent(fixture_id, "GOAL_PUSH_2H"):
             msg = (
                 f"🟠 GOAL PUSH 2H\n"
@@ -200,7 +245,7 @@ def check_alerts_for_match(match: dict):
             send_telegram(msg)
 
     # Alert 5: LATE GOAL
-    if minute != -1 and 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
+    if 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
         if not already_sent(fixture_id, "LATE_GOAL"):
             msg = (
                 f"🔴 LATE GOAL\n"
@@ -211,7 +256,7 @@ def check_alerts_for_match(match: dict):
             send_telegram(msg)
 
     # Alert 6: LAST MINUTE GOAL
-    if minute != -1 and 85 <= minute <= 88 and sot_total >= 10:
+    if 85 <= minute <= 88 and sot_total >= 10:
         if not already_sent(fixture_id, "LAST_MINUTE_GOAL"):
             msg = (
                 f"🟣 LAST MINUTE GOAL\n"
@@ -222,23 +267,8 @@ def check_alerts_for_match(match: dict):
             send_telegram(msg)
 
 
-def validate_env():
-    missing = []
-    if not API_KEY:
-        missing.append("API_FOOTBALL_KEY")
-    if not TELEGRAM_TOKEN:
-        missing.append("TELEGRAM_TOKEN")
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-
-    if missing:
-        print("Missing environment variables: " + ", ".join(missing))
-    else:
-        print("All required environment variables are set.")
-
-
 def main():
-    print("Live Alert Engine v2 Started (HT exact)")
+    print("Live Alert Engine v3 Started (Relevant windows + 60s stats cooldown)")
     validate_env()
 
     while True:
