@@ -3,6 +3,12 @@ import time
 import json
 import re
 import requests
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 API_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -14,9 +20,18 @@ HEADERS = {"x-apisports-key": API_KEY}
 DATA_DIR = os.getenv("DATA_DIR", "/data").strip() or "/data"
 LEAGUE_CACHE_FILE = os.path.join(DATA_DIR, "league_cache.json")
 SENT_ALERTS_FILE = os.path.join(DATA_DIR, "sent_alerts.json")
+ALERT_LOG_FILE = os.path.join(DATA_DIR, "alert_log.json")
+DAILY_STATS_FILE = os.path.join(DATA_DIR, "daily_stats.json")
 
 LEAGUE_CACHE_TTL_SEC = 24 * 60 * 60
 STATS_COOLDOWN_SEC = 60
+
+REPORT_TZ = os.getenv("REPORT_TZ", "Europe/London").strip() or "Europe/London"
+REPORT_HOUR = int(os.getenv("REPORT_HOUR", "22").strip() or "22")
+REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "0").strip() or "0")
+
+FINISH_CHECK_COOLDOWN_SEC = 300  # FT checks
+HT_CHECK_COOLDOWN_SEC = 60       # HT checks for GOAL_1H
 
 STATS_CACHE = {}
 SENT_ALERTS = set()
@@ -65,6 +80,15 @@ ALLOWED_LEAGUE_KEYS = [
     ("Spain", "Copa del Rey"),
 ]
 
+ALERT_META = {
+    "GOAL_1H": {"title": "🟢 GOAL 1H", "pick": "Over 0.5 goals (1st Half)"},
+    "TWO_GOALS_2H": {"title": "🟡 2 GOALS 2H", "pick": "Over 1.5 goals (2nd Half)"},
+    "OVER_2_5_GOALS": {"title": "🔵 OVER 2.5 GOALS", "pick": "Over 2.5 goals (Full Time)"},
+    "GOAL_PUSH_2H": {"title": "🟠 GOAL PUSH 2H", "pick": "Over 0.5 goals (2nd Half)"},
+    "LATE_GOAL": {"title": "🔴 LATE GOAL", "pick": "1 more goal"},
+    "LAST_MINUTE_GOAL": {"title": "🟣 LAST MINUTE GOAL", "pick": "Goal (Last Minutes)"},
+}
+
 
 def _safe_int(v, default=0):
     try:
@@ -88,6 +112,19 @@ def ensure_data_dir():
         os.makedirs(DATA_DIR, exist_ok=True)
     except Exception as ex:
         print(f"Failed to create data dir '{DATA_DIR}': {ex}")
+
+
+def now_local():
+    if ZoneInfo is None:
+        return datetime.utcnow()
+    try:
+        return datetime.now(ZoneInfo(REPORT_TZ))
+    except Exception:
+        return datetime.utcnow()
+
+
+def today_key():
+    return now_local().date().isoformat()
 
 
 def validate_env():
@@ -139,6 +176,20 @@ def get_live_fixtures():
         return []
 
 
+def get_fixture_by_id(fixture_id: int):
+    url = f"{API_BASE}/fixtures?id={fixture_id}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=25)
+        data = r.json()
+        resp = data.get("response", [])
+        if isinstance(resp, list) and len(resp) > 0:
+            return resp[0]
+        return None
+    except Exception as ex:
+        print(f"Fixture lookup failed for {fixture_id}: {ex}")
+        return None
+
+
 def should_fetch_stats(minute: int, status_short: str) -> bool:
     if status_short == "HT":
         return True
@@ -156,9 +207,9 @@ def should_fetch_stats(minute: int, status_short: str) -> bool:
 
 
 def get_sot_cached(fixture_id: int):
-    now = time.time()
+    now_ts = time.time()
     cached = STATS_CACHE.get(fixture_id)
-    if cached and (now - cached["ts"] < STATS_COOLDOWN_SEC):
+    if cached and (now_ts - cached["ts"] < STATS_COOLDOWN_SEC):
         return cached["home"], cached["away"]
 
     url = f"{API_BASE}/fixtures/statistics?fixture={fixture_id}"
@@ -178,7 +229,7 @@ def get_sot_cached(fixture_id: int):
             home_sot = extract_sot(resp[0])
             away_sot = extract_sot(resp[1])
 
-        STATS_CACHE[fixture_id] = {"home": home_sot, "away": away_sot, "ts": now}
+        STATS_CACHE[fixture_id] = {"home": home_sot, "away": away_sot, "ts": now_ts}
         return home_sot, away_sot
 
     except Exception as ex:
@@ -231,12 +282,12 @@ def resolve_allowed_league_ids():
     desired = set((_norm(c), _norm(n)) for (c, n) in ALLOWED_LEAGUE_KEYS)
 
     cache = load_json_file(LEAGUE_CACHE_FILE)
-    now = int(time.time())
+    now_ts = int(time.time())
 
     if isinstance(cache, dict):
         ts = _safe_int(cache.get("ts"), 0)
         ids = cache.get("ids", [])
-        if ts > 0 and (now - ts) < LEAGUE_CACHE_TTL_SEC and isinstance(ids, list) and ids:
+        if ts > 0 and (now_ts - ts) < LEAGUE_CACHE_TTL_SEC and isinstance(ids, list) and ids:
             allowed_ids = set(_safe_int(x, 0) for x in ids if _safe_int(x, 0) > 0)
             print(f"Loaded {len(allowed_ids)} league IDs from disk cache.")
             return allowed_ids
@@ -262,7 +313,7 @@ def resolve_allowed_league_ids():
             if league_id > 0 and (country_name, league_name) in desired:
                 allowed_ids.add(league_id)
 
-        save_json_file(LEAGUE_CACHE_FILE, {"ts": now, "ids": sorted(list(allowed_ids))})
+        save_json_file(LEAGUE_CACHE_FILE, {"ts": now_ts, "ids": sorted(list(allowed_ids))})
         print(f"Resolved and cached {len(allowed_ids)} league IDs to disk.")
         return allowed_ids
 
@@ -296,6 +347,317 @@ def build_premium_message(alert_title: str, league_name: str, country: str, home
         f"📊 Pick:\n{pick_text}"
     )
     return msg
+
+
+def parse_score(score_str: str):
+    try:
+        s = (score_str or "").strip()
+        if "-" not in s:
+            return 0, 0
+        left, right = s.split("-", 1)
+        return _safe_int(left.strip(), 0), _safe_int(right.strip(), 0)
+    except Exception:
+        return 0, 0
+
+
+def load_alert_log():
+    payload = load_json_file(ALERT_LOG_FILE)
+    if isinstance(payload, dict):
+        if "alerts" not in payload or not isinstance(payload.get("alerts"), dict):
+            payload["alerts"] = {}
+        return payload
+    return {"alerts": {}}
+
+
+def save_alert_log(log_data: dict):
+    save_json_file(ALERT_LOG_FILE, log_data)
+
+
+def load_daily_stats():
+    payload = load_json_file(DAILY_STATS_FILE)
+    if isinstance(payload, dict):
+        return payload
+    return {
+        "date": today_key(),
+        "matches_scanned": 0,
+        "alerts_sent": {k: 0 for k in ALERT_META.keys()},
+        "wins": 0,
+        "losses": 0,
+        "pending": 0,
+        "report_sent_date": ""
+    }
+
+
+def save_daily_stats(stats: dict):
+    save_json_file(DAILY_STATS_FILE, stats)
+
+
+def reset_daily_stats_if_needed(stats: dict):
+    tk = today_key()
+    if stats.get("date") != tk:
+        stats["date"] = tk
+        stats["matches_scanned"] = 0
+        stats["alerts_sent"] = {k: 0 for k in ALERT_META.keys()}
+        stats["wins"] = 0
+        stats["losses"] = 0
+        stats["pending"] = 0
+        stats["report_sent_date"] = ""
+        save_daily_stats(stats)
+
+
+def recompute_today_results_from_log():
+    log_data = load_alert_log()
+    alerts = log_data.get("alerts", {})
+    today_str = today_key()
+
+    w = 0
+    l = 0
+    p = 0
+
+    for a in alerts.values():
+        if not isinstance(a, dict):
+            continue
+        if a.get("sent_date") != today_str:
+            continue
+        if a.get("resolved") is True and a.get("result") == "WIN":
+            w += 1
+        elif a.get("resolved") is True and a.get("result") == "LOSE":
+            l += 1
+        else:
+            p += 1
+
+    stats = load_daily_stats()
+    reset_daily_stats_if_needed(stats)
+    stats["wins"] = w
+    stats["losses"] = l
+    stats["pending"] = p
+    save_daily_stats(stats)
+
+
+def register_alert_send(alert_code: str, fixture_id: int, minute: int, status_short: str,
+                        score_str: str, league_name: str, country: str, home: str, away: str):
+    log_data = load_alert_log()
+    alerts = log_data.get("alerts", {})
+    key = f"{fixture_id}|{alert_code}"
+
+    hg, ag = parse_score(score_str)
+    total_goals_at_send = hg + ag
+
+    alerts[key] = {
+        "fixture_id": fixture_id,
+        "alert_code": alert_code,
+        "sent_ts": int(time.time()),
+        "sent_date": today_key(),
+        "minute": minute,
+        "status_short": status_short,
+        "score_at_send": score_str,
+        "total_goals_at_send": total_goals_at_send,
+        "league_name": league_name,
+        "country": country,
+        "home": home,
+        "away": away,
+        "resolved": False,
+        "result": "PENDING",
+        "last_finish_check_ts": 0,
+        "last_ht_check_ts": 0
+    }
+
+    log_data["alerts"] = alerts
+    save_alert_log(log_data)
+
+    stats = load_daily_stats()
+    reset_daily_stats_if_needed(stats)
+    stats["alerts_sent"][alert_code] = int(stats["alerts_sent"].get(alert_code, 0)) + 1
+    save_daily_stats(stats)
+
+
+def evaluate_alert_outcome_ft(alert: dict, fixture_obj: dict):
+    fixture = fixture_obj.get("fixture", {}) or {}
+    status = fixture.get("status", {}) or {}
+    status_short = (status.get("short") or "").strip().upper()
+
+    if status_short not in ("FT", "AET", "PEN"):
+        return None
+
+    goals = fixture_obj.get("goals", {}) or {}
+    ft_home = _safe_int(goals.get("home"), 0)
+    ft_away = _safe_int(goals.get("away"), 0)
+    ft_total = ft_home + ft_away
+
+    score_obj = fixture_obj.get("score", {}) or {}
+    halftime = score_obj.get("halftime", {}) or {}
+    ht_home = _safe_int(halftime.get("home"), 0)
+    ht_away = _safe_int(halftime.get("away"), 0)
+    ht_total = ht_home + ht_away
+
+    alert_code = alert.get("alert_code")
+
+    if alert_code == "TWO_GOALS_2H":
+        sh_goals = max(0, ft_total - ht_total)
+        return "WIN" if sh_goals >= 2 else "LOSE"
+
+    if alert_code == "OVER_2_5_GOALS":
+        return "WIN" if ft_total >= 3 else "LOSE"
+
+    if alert_code == "GOAL_PUSH_2H":
+        sh_goals = max(0, ft_total - ht_total)
+        return "WIN" if sh_goals >= 1 else "LOSE"
+
+    if alert_code in ("LATE_GOAL", "LAST_MINUTE_GOAL"):
+        base_total = _safe_int(alert.get("total_goals_at_send"), 0)
+        return "WIN" if ft_total > base_total else "LOSE"
+
+    return None
+
+
+def resolve_goal1h_at_ht_if_possible():
+    log_data = load_alert_log()
+    alerts = log_data.get("alerts", {})
+    if not isinstance(alerts, dict) or not alerts:
+        return
+
+    now_ts = int(time.time())
+    changed = False
+
+    for k, a in alerts.items():
+        if not isinstance(a, dict):
+            continue
+
+        if a.get("resolved") is True:
+            continue
+
+        if a.get("alert_code") != "GOAL_1H":
+            continue
+
+        last_ht = _safe_int(a.get("last_ht_check_ts"), 0)
+        if last_ht > 0 and (now_ts - last_ht) < HT_CHECK_COOLDOWN_SEC:
+            continue
+
+        fixture_id = _safe_int(a.get("fixture_id"), 0)
+        if fixture_id <= 0:
+            continue
+
+        a["last_ht_check_ts"] = now_ts
+        fixture_obj = get_fixture_by_id(fixture_id)
+        if not fixture_obj:
+            changed = True
+            continue
+
+        fixture = fixture_obj.get("fixture", {}) or {}
+        status = fixture.get("status", {}) or {}
+        status_short = (status.get("short") or "").strip().upper()
+
+        if status_short != "HT":
+            changed = True
+            continue
+
+        score_obj = fixture_obj.get("score", {}) or {}
+        halftime = score_obj.get("halftime", {}) or {}
+        ht_home = _safe_int(halftime.get("home"), 0)
+        ht_away = _safe_int(halftime.get("away"), 0)
+        ht_total = ht_home + ht_away
+
+        a["resolved"] = True
+        a["result"] = "WIN" if ht_total >= 1 else "LOSE"
+        changed = True
+
+    if changed:
+        log_data["alerts"] = alerts
+        save_alert_log(log_data)
+        recompute_today_results_from_log()
+
+
+def resolve_other_alerts_at_ft():
+    log_data = load_alert_log()
+    alerts = log_data.get("alerts", {})
+    if not isinstance(alerts, dict) or not alerts:
+        return
+
+    now_ts = int(time.time())
+    changed = False
+
+    for k, a in alerts.items():
+        if not isinstance(a, dict):
+            continue
+
+        if a.get("resolved") is True:
+            continue
+
+        if a.get("alert_code") == "GOAL_1H":
+            continue
+
+        last_check = _safe_int(a.get("last_finish_check_ts"), 0)
+        if last_check > 0 and (now_ts - last_check) < FINISH_CHECK_COOLDOWN_SEC:
+            continue
+
+        fixture_id = _safe_int(a.get("fixture_id"), 0)
+        if fixture_id <= 0:
+            continue
+
+        a["last_finish_check_ts"] = now_ts
+        fixture_obj = get_fixture_by_id(fixture_id)
+        if not fixture_obj:
+            changed = True
+            continue
+
+        outcome = evaluate_alert_outcome_ft(a, fixture_obj)
+        if outcome in ("WIN", "LOSE"):
+            a["resolved"] = True
+            a["result"] = outcome
+            changed = True
+        else:
+            changed = True
+
+    if changed:
+        log_data["alerts"] = alerts
+        save_alert_log(log_data)
+        recompute_today_results_from_log()
+
+
+def maybe_send_daily_report():
+    stats = load_daily_stats()
+    reset_daily_stats_if_needed(stats)
+
+    now_dt = now_local()
+    if now_dt.hour != REPORT_HOUR or now_dt.minute != REPORT_MINUTE:
+        return
+
+    today_str = today_key()
+    if stats.get("report_sent_date") == today_str:
+        return
+
+    total_alerts = sum(int(v) for v in (stats.get("alerts_sent") or {}).values())
+
+    lines = []
+    lines.append("📊 DAILY REPORT")
+    lines.append("")
+    lines.append(f"Date: {today_str}")
+    lines.append(f"Matches scanned: {int(stats.get('matches_scanned', 0))}")
+    lines.append(f"Alerts sent: {total_alerts}")
+    lines.append("")
+
+    lines.append("Alerts breakdown:")
+    for code, meta in ALERT_META.items():
+        cnt = int((stats.get("alerts_sent") or {}).get(code, 0))
+        lines.append(f"- {meta['title']}: {cnt}")
+
+    lines.append("")
+    lines.append("Results (today):")
+    lines.append(f"✅ Wins: {int(stats.get('wins', 0))}")
+    lines.append(f"❌ Losses: {int(stats.get('losses', 0))}")
+    lines.append(f"⏳ Pending: {int(stats.get('pending', 0))}")
+
+    win = int(stats.get("wins", 0))
+    lose = int(stats.get("losses", 0))
+    denom = win + lose
+    if denom > 0:
+        winrate = (win / denom) * 100.0
+        lines.append(f"🎯 Winrate: {winrate:.1f}%")
+
+    msg = "\n".join(lines)
+    if send_telegram(msg):
+        stats["report_sent_date"] = today_str
+        save_daily_stats(stats)
 
 
 def check_alerts_for_match(match: dict, allowed_league_ids: set):
@@ -333,94 +695,131 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
     sot_total = home_sot + away_sot
 
     if 20 <= minute <= 30 and score == "0 - 0" and sot_total >= 3:
-        if not already_sent(fixture_id, "GOAL_1H"):
+        code = "GOAL_1H"
+        if not already_sent(fixture_id, code):
             msg = build_premium_message(
-                "🟢 GOAL 1H",
+                ALERT_META[code]["title"],
                 league_name, country,
                 home_name, away_name,
                 minute, status_short,
                 score, home_sot, away_sot,
-                "Over 0.5 goals (1st Half)"
+                ALERT_META[code]["pick"]
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                register_alert_send(code, fixture_id, minute, status_short, score, league_name, country, home_name, away_name)
 
     if status_short == "HT" and score == "0 - 0" and sot_total >= 5:
-        if not already_sent(fixture_id, "TWO_GOALS_2H"):
+        code = "TWO_GOALS_2H"
+        if not already_sent(fixture_id, code):
             msg = build_premium_message(
-                "🟡 2 GOALS 2H",
+                ALERT_META[code]["title"],
                 league_name, country,
                 home_name, away_name,
                 minute, status_short,
                 score, home_sot, away_sot,
-                "Over 1.5 goals (2nd Half)"
+                ALERT_META[code]["pick"]
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                register_alert_send(code, fixture_id, minute, status_short, score, league_name, country, home_name, away_name)
 
     if status_short == "HT" and score in ("1 - 0", "0 - 1") and sot_total >= 4:
-        if not already_sent(fixture_id, "OVER_2_5_GOALS"):
+        code = "OVER_2_5_GOALS"
+        if not already_sent(fixture_id, code):
             msg = build_premium_message(
-                "🔵 OVER 2.5 GOALS",
+                ALERT_META[code]["title"],
                 league_name, country,
                 home_name, away_name,
                 minute, status_short,
                 score, home_sot, away_sot,
-                "Over 2.5 goals (Full Time)"
+                ALERT_META[code]["pick"]
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                register_alert_send(code, fixture_id, minute, status_short, score, league_name, country, home_name, away_name)
 
     if 50 <= minute <= 70 and score == "1 - 1" and sot_total >= 6:
-        if not already_sent(fixture_id, "GOAL_PUSH_2H"):
+        code = "GOAL_PUSH_2H"
+        if not already_sent(fixture_id, code):
             msg = build_premium_message(
-                "🟠 GOAL PUSH 2H",
+                ALERT_META[code]["title"],
                 league_name, country,
                 home_name, away_name,
                 minute, status_short,
                 score, home_sot, away_sot,
-                "Over 0.5 goals (2nd Half)"
+                ALERT_META[code]["pick"]
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                register_alert_send(code, fixture_id, minute, status_short, score, league_name, country, home_name, away_name)
 
     if 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
-        if not already_sent(fixture_id, "LATE_GOAL"):
+        code = "LATE_GOAL"
+        if not already_sent(fixture_id, code):
             msg = build_premium_message(
-                "🔴 LATE GOAL",
+                ALERT_META[code]["title"],
                 league_name, country,
                 home_name, away_name,
                 minute, status_short,
                 score, home_sot, away_sot,
-                "1 more goal"
+                ALERT_META[code]["pick"]
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                register_alert_send(code, fixture_id, minute, status_short, score, league_name, country, home_name, away_name)
 
     if 85 <= minute <= 88 and sot_total >= 10:
-        if not already_sent(fixture_id, "LAST_MINUTE_GOAL"):
+        code = "LAST_MINUTE_GOAL"
+        if not already_sent(fixture_id, code):
             msg = build_premium_message(
-                "🟣 LAST MINUTE GOAL",
+                ALERT_META[code]["title"],
                 league_name, country,
                 home_name, away_name,
                 minute, status_short,
                 score, home_sot, away_sot,
-                "Goal (Last Minutes)"
+                ALERT_META[code]["pick"]
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                register_alert_send(code, fixture_id, minute, status_short, score, league_name, country, home_name, away_name)
 
 
 def main():
     ensure_data_dir()
-    print("Live Alert Engine v5 Started (Premium Telegram format)")
+    print("Live Alert Engine v7 Started (GOAL_1H settles at HT, others at FT + Daily Report)")
     validate_env()
 
     load_sent_alerts()
     allowed_league_ids = resolve_allowed_league_ids()
     print(f"Allowed league IDs active: {len(allowed_league_ids)}")
 
+    stats = load_daily_stats()
+    reset_daily_stats_if_needed(stats)
+
     while True:
+        stats = load_daily_stats()
+        reset_daily_stats_if_needed(stats)
+
         matches = get_live_fixtures()
+        stats["matches_scanned"] = int(stats.get("matches_scanned", 0)) + int(len(matches))
+        save_daily_stats(stats)
+
         for m in matches:
             try:
                 check_alerts_for_match(m, allowed_league_ids)
             except Exception as ex:
                 print(f"Alert check error: {ex}")
+
+        try:
+            resolve_goal1h_at_ht_if_possible()
+        except Exception as ex:
+            print(f"HT settle error: {ex}")
+
+        try:
+            resolve_other_alerts_at_ft()
+        except Exception as ex:
+            print(f"FT settle error: {ex}")
+
+        try:
+            maybe_send_daily_report()
+        except Exception as ex:
+            print(f"Daily report error: {ex}")
+
         time.sleep(60)
 
 
