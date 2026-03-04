@@ -12,7 +12,6 @@ HEADERS = {
     "x-apisports-key": API_KEY
 }
 
-# Allowed league IDs (whitelist). You can add/remove IDs anytime.
 ALLOWED_LEAGUES = {
     39,   # England - Premier League
     40,   # England - Championship
@@ -45,8 +44,6 @@ ALLOWED_LEAGUES = {
     253,  # USA - Major League Soccer
 }
 
-# In-memory anti-duplicate: fixture_id|alert_code
-# Note: This resets if the container restarts. We can upgrade to persistent storage later.
 SENT_ALERTS = set()
 
 
@@ -104,7 +101,6 @@ def get_shots_on_target(fixture_id: int):
         data = r.json()
         resp = data.get("response", [])
 
-        # Expected shape: [ {team, statistics:[...]}, {team, statistics:[...]} ]
         if not isinstance(resp, list) or len(resp) < 2:
             return 0, 0
 
@@ -144,11 +140,10 @@ def check_alerts_for_match(match: dict):
     if league_id not in ALLOWED_LEAGUES:
         return
 
-    status = fixture.get("status", {})
-    minute = status.get("elapsed")
-    minute = _safe_int(minute, -1)
-    if minute < 0:
-        return
+    status = fixture.get("status", {}) or {}
+    status_short = (status.get("short") or "").strip().upper()
+
+    minute = _safe_int(status.get("elapsed"), -1)
 
     home_name = (teams.get("home", {}) or {}).get("name", "Home")
     away_name = (teams.get("away", {}) or {}).get("name", "Away")
@@ -161,7 +156,7 @@ def check_alerts_for_match(match: dict):
     sot_total = home_sot + away_sot
 
     # Alert 1: GOAL 1H
-    if 20 <= minute <= 30 and score == "0 - 0" and sot_total >= 3:
+    if minute != -1 and 20 <= minute <= 30 and score == "0 - 0" and sot_total >= 3:
         if not already_sent(fixture_id, "GOAL_1H"):
             msg = (
                 f"🟢 GOAL 1H\n"
@@ -171,30 +166,30 @@ def check_alerts_for_match(match: dict):
             )
             send_telegram(msg)
 
-    # Alert 2: 2 GOALS 2H (Excel version uses HT; here we approximate with minute==46)
-    if minute == 46 and score == "0 - 0" and sot_total >= 5:
+    # Alert 2: 2 GOALS 2H (HT exact)
+    if status_short == "HT" and score == "0 - 0" and sot_total >= 5:
         if not already_sent(fixture_id, "TWO_GOALS_2H"):
             msg = (
                 f"🟡 2 GOALS 2H\n"
                 f"{home_name} vs {away_name}\n"
-                f"HT trigger\n"
+                f"Status: HT\n"
                 f"SOT: {home_sot} - {away_sot}"
             )
             send_telegram(msg)
 
-    # Alert 3: OVER 2.5 GOALS (HT)
-    if minute == 46 and score in ("1 - 0", "0 - 1") and sot_total >= 4:
+    # Alert 3: OVER 2.5 GOALS (HT exact)
+    if status_short == "HT" and score in ("1 - 0", "0 - 1") and sot_total >= 4:
         if not already_sent(fixture_id, "OVER_2_5_GOALS"):
             msg = (
                 f"🔵 OVER 2.5 GOALS\n"
                 f"{home_name} vs {away_name}\n"
-                f"HT trigger\n"
+                f"Status: HT\n"
                 f"SOT: {home_sot} - {away_sot}"
             )
             send_telegram(msg)
 
     # Alert 4: GOAL PUSH 2H
-    if 50 <= minute <= 70 and score == "1 - 1" and sot_total >= 6:
+    if minute != -1 and 50 <= minute <= 70 and score == "1 - 1" and sot_total >= 6:
         if not already_sent(fixture_id, "GOAL_PUSH_2H"):
             msg = (
                 f"🟠 GOAL PUSH 2H\n"
@@ -205,7 +200,7 @@ def check_alerts_for_match(match: dict):
             send_telegram(msg)
 
     # Alert 5: LATE GOAL
-    if 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
+    if minute != -1 and 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
         if not already_sent(fixture_id, "LATE_GOAL"):
             msg = (
                 f"🔴 LATE GOAL\n"
@@ -216,7 +211,7 @@ def check_alerts_for_match(match: dict):
             send_telegram(msg)
 
     # Alert 6: LAST MINUTE GOAL
-    if 85 <= minute <= 88 and sot_total >= 10:
+    if minute != -1 and 85 <= minute <= 88 and sot_total >= 10:
         if not already_sent(fixture_id, "LAST_MINUTE_GOAL"):
             msg = (
                 f"🟣 LAST MINUTE GOAL\n"
@@ -243,7 +238,7 @@ def validate_env():
 
 
 def main():
-    print("Live Alert Engine v2 Started")
+    print("Live Alert Engine v2 Started (HT exact)")
     validate_env()
 
     while True:
