@@ -11,19 +11,20 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 API_BASE = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 
-# Mapping cache file (stored in repo container filesystem; resets if container rebuilds)
-LEAGUE_CACHE_FILE = "league_cache.json"
+DATA_DIR = os.getenv("DATA_DIR", "/data").strip() or "/data"
+LEAGUE_CACHE_FILE = os.path.join(DATA_DIR, "league_cache.json")
+SENT_ALERTS_FILE = os.path.join(DATA_DIR, "sent_alerts.json")
+
 LEAGUE_CACHE_TTL_SEC = 24 * 60 * 60  # 24h
+STATS_COOLDOWN_SEC = 60  # 1 minute cooldown (relevant windows only)
 
 # Stats cache: fixture_id -> {"home": int, "away": int, "ts": float}
 STATS_CACHE = {}
-STATS_COOLDOWN_SEC = 60  # 1 minute cooldown (as requested)
 
-# In-memory anti-duplicate: fixture_id|alert_code
+# In-memory + persisted anti-duplicate: fixture_id|alert_code
 SENT_ALERTS = set()
 
-# Your premium whitelist (Country + League Name) exactly as your project memory
-# The engine will resolve these into stable league IDs.
+
 ALLOWED_LEAGUE_KEYS = [
     ("Egypt", "Premier League"),
     ("USA", "Major League Soccer"),
@@ -84,6 +85,13 @@ def _norm(s: str) -> str:
     s = s.replace(".", "")
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+def ensure_data_dir():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception as ex:
+        print(f"Failed to create data dir '{DATA_DIR}': {ex}")
 
 
 def validate_env():
@@ -179,45 +187,60 @@ def get_sot_cached(fixture_id: int):
         return 0, 0
 
 
-def already_sent(fixture_id: int, alert_code: str) -> bool:
-    key = f"{fixture_id}|{alert_code}"
-    if key in SENT_ALERTS:
-        return True
-    SENT_ALERTS.add(key)
-    return False
-
-
-def load_league_cache():
+def load_json_file(path: str):
     try:
-        with open(LEAGUE_CACHE_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
 
-def save_league_cache(payload: dict):
+def save_json_file(path: str, payload):
     try:
-        with open(LEAGUE_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as ex:
-        print(f"Failed to save league cache: {ex}")
+        print(f"Failed to save file '{path}': {ex}")
+
+
+def load_sent_alerts():
+    global SENT_ALERTS
+    payload = load_json_file(SENT_ALERTS_FILE)
+    if isinstance(payload, list):
+        SENT_ALERTS = set(str(x) for x in payload)
+        print(f"Loaded {len(SENT_ALERTS)} sent alerts from disk.")
+    else:
+        print("No sent alerts file found; starting fresh.")
+
+
+def persist_sent_alerts():
+    save_json_file(SENT_ALERTS_FILE, sorted(list(SENT_ALERTS)))
+
+
+def already_sent(fixture_id: int, alert_code: str) -> bool:
+    key = f"{fixture_id}|{alert_code}"
+    if key in SENT_ALERTS:
+        return True
+    SENT_ALERTS.add(key)
+    persist_sent_alerts()
+    return False
 
 
 def resolve_allowed_league_ids():
     desired = set((_norm(c), _norm(n)) for (c, n) in ALLOWED_LEAGUE_KEYS)
 
-    cache = load_league_cache()
+    cache = load_json_file(LEAGUE_CACHE_FILE)
     now = int(time.time())
 
-    if cache and isinstance(cache, dict):
+    if isinstance(cache, dict):
         ts = _safe_int(cache.get("ts"), 0)
         ids = cache.get("ids", [])
         if ts > 0 and (now - ts) < LEAGUE_CACHE_TTL_SEC and isinstance(ids, list) and ids:
             allowed_ids = set(_safe_int(x, 0) for x in ids if _safe_int(x, 0) > 0)
-            print(f"Loaded {len(allowed_ids)} league IDs from cache.")
+            print(f"Loaded {len(allowed_ids)} league IDs from disk cache.")
             return allowed_ids
 
-    print("Resolving league IDs from API (cache miss/expired)...")
+    print("Resolving league IDs from API (disk cache miss/expired)...")
 
     url = f"{API_BASE}/leagues"
     allowed_ids = set()
@@ -238,8 +261,8 @@ def resolve_allowed_league_ids():
             if league_id > 0 and (country_name, league_name) in desired:
                 allowed_ids.add(league_id)
 
-        save_league_cache({"ts": now, "ids": sorted(list(allowed_ids))})
-        print(f"Resolved and cached {len(allowed_ids)} league IDs.")
+        save_json_file(LEAGUE_CACHE_FILE, {"ts": now, "ids": sorted(list(allowed_ids))})
+        print(f"Resolved and cached {len(allowed_ids)} league IDs to disk.")
         return allowed_ids
 
     except Exception as ex:
@@ -340,9 +363,11 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
 
 
 def main():
-    print("Live Alert Engine Premium Started (IDs resolved + relevant windows + 60s stats cooldown)")
+    ensure_data_dir()
+    print("Live Alert Engine v4 Started (Disk cache + persistent anti-duplicate)")
     validate_env()
 
+    load_sent_alerts()
     allowed_league_ids = resolve_allowed_league_ids()
     print(f"Allowed league IDs active: {len(allowed_league_ids)}")
 
