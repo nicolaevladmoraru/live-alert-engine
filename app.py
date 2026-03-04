@@ -18,6 +18,7 @@ API_BASE = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 
 DATA_DIR = os.getenv("DATA_DIR", "/data").strip() or "/data"
+
 LEAGUE_CACHE_FILE = os.path.join(DATA_DIR, "league_cache.json")
 SENT_ALERTS_FILE = os.path.join(DATA_DIR, "sent_alerts.json")
 ALERT_LOG_FILE = os.path.join(DATA_DIR, "alert_log.json")
@@ -30,8 +31,8 @@ REPORT_TZ = os.getenv("REPORT_TZ", "Europe/London").strip() or "Europe/London"
 REPORT_HOUR = int(os.getenv("REPORT_HOUR", "22").strip() or "22")
 REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "0").strip() or "0")
 
-FINISH_CHECK_COOLDOWN_SEC = 300  # FT checks
-HT_CHECK_COOLDOWN_SEC = 60       # HT checks for GOAL_1H
+FINISH_CHECK_COOLDOWN_SEC = 300
+HT_CHECK_COOLDOWN_SEC = 60
 
 STATS_CACHE = {}
 SENT_ALERTS = set()
@@ -380,10 +381,6 @@ def load_daily_stats():
     return {
         "date": today_key(),
         "matches_scanned": 0,
-        "alerts_sent": {k: 0 for k in ALERT_META.keys()},
-        "wins": 0,
-        "losses": 0,
-        "pending": 0,
         "report_sent_date": ""
     }
 
@@ -397,41 +394,8 @@ def reset_daily_stats_if_needed(stats: dict):
     if stats.get("date") != tk:
         stats["date"] = tk
         stats["matches_scanned"] = 0
-        stats["alerts_sent"] = {k: 0 for k in ALERT_META.keys()}
-        stats["wins"] = 0
-        stats["losses"] = 0
-        stats["pending"] = 0
         stats["report_sent_date"] = ""
         save_daily_stats(stats)
-
-
-def recompute_today_results_from_log():
-    log_data = load_alert_log()
-    alerts = log_data.get("alerts", {})
-    today_str = today_key()
-
-    w = 0
-    l = 0
-    p = 0
-
-    for a in alerts.values():
-        if not isinstance(a, dict):
-            continue
-        if a.get("sent_date") != today_str:
-            continue
-        if a.get("resolved") is True and a.get("result") == "WIN":
-            w += 1
-        elif a.get("resolved") is True and a.get("result") == "LOSE":
-            l += 1
-        else:
-            p += 1
-
-    stats = load_daily_stats()
-    reset_daily_stats_if_needed(stats)
-    stats["wins"] = w
-    stats["losses"] = l
-    stats["pending"] = p
-    save_daily_stats(stats)
 
 
 def register_alert_send(alert_code: str, fixture_id: int, minute: int, status_short: str,
@@ -464,11 +428,6 @@ def register_alert_send(alert_code: str, fixture_id: int, minute: int, status_sh
 
     log_data["alerts"] = alerts
     save_alert_log(log_data)
-
-    stats = load_daily_stats()
-    reset_daily_stats_if_needed(stats)
-    stats["alerts_sent"][alert_code] = int(stats["alerts_sent"].get(alert_code, 0)) + 1
-    save_daily_stats(stats)
 
 
 def evaluate_alert_outcome_ft(alert: dict, fixture_obj: dict):
@@ -519,7 +478,7 @@ def resolve_goal1h_at_ht_if_possible():
     now_ts = int(time.time())
     changed = False
 
-    for k, a in alerts.items():
+    for a in alerts.values():
         if not isinstance(a, dict):
             continue
 
@@ -564,7 +523,6 @@ def resolve_goal1h_at_ht_if_possible():
     if changed:
         log_data["alerts"] = alerts
         save_alert_log(log_data)
-        recompute_today_results_from_log()
 
 
 def resolve_other_alerts_at_ft():
@@ -576,7 +534,7 @@ def resolve_other_alerts_at_ft():
     now_ts = int(time.time())
     changed = False
 
-    for k, a in alerts.items():
+    for a in alerts.values():
         if not isinstance(a, dict):
             continue
 
@@ -611,7 +569,54 @@ def resolve_other_alerts_at_ft():
     if changed:
         log_data["alerts"] = alerts
         save_alert_log(log_data)
-        recompute_today_results_from_log()
+
+
+def compute_today_breakdown_from_log():
+    log_data = load_alert_log()
+    alerts = log_data.get("alerts", {})
+    today_str = today_key()
+
+    per_code = {}
+    for code in ALERT_META.keys():
+        per_code[code] = {"total": 0, "win": 0, "lose": 0, "pending": 0}
+
+    overall = {"win": 0, "lose": 0, "pending": 0, "total": 0}
+
+    if not isinstance(alerts, dict):
+        return per_code, overall
+
+    for a in alerts.values():
+        if not isinstance(a, dict):
+            continue
+        if a.get("sent_date") != today_str:
+            continue
+
+        code = a.get("alert_code")
+        if code not in per_code:
+            continue
+
+        per_code[code]["total"] += 1
+        overall["total"] += 1
+
+        res = (a.get("result") or "PENDING").upper()
+        if a.get("resolved") is True and res == "WIN":
+            per_code[code]["win"] += 1
+            overall["win"] += 1
+        elif a.get("resolved") is True and res == "LOSE":
+            per_code[code]["lose"] += 1
+            overall["lose"] += 1
+        else:
+            per_code[code]["pending"] += 1
+            overall["pending"] += 1
+
+    return per_code, overall
+
+
+def format_win_rate(win: int, lose: int):
+    denom = win + lose
+    if denom <= 0:
+        return None
+    return (win / denom) * 100.0
 
 
 def maybe_send_daily_report():
@@ -626,33 +631,40 @@ def maybe_send_daily_report():
     if stats.get("report_sent_date") == today_str:
         return
 
-    total_alerts = sum(int(v) for v in (stats.get("alerts_sent") or {}).values())
+    per_code, overall = compute_today_breakdown_from_log()
 
     lines = []
     lines.append("📊 DAILY REPORT")
     lines.append("")
     lines.append(f"Date: {today_str}")
     lines.append(f"Matches scanned: {int(stats.get('matches_scanned', 0))}")
-    lines.append(f"Alerts sent: {total_alerts}")
+    lines.append(f"Alerts sent: {int(overall.get('total', 0))}")
     lines.append("")
+    lines.append("Alerts breakdown (Win/Total):")
 
-    lines.append("Alerts breakdown:")
     for code, meta in ALERT_META.items():
-        cnt = int((stats.get("alerts_sent") or {}).get(code, 0))
-        lines.append(f"- {meta['title']}: {cnt}")
+        w = int(per_code[code]["win"])
+        l = int(per_code[code]["lose"])
+        t = int(per_code[code]["total"])
+
+        pct = format_win_rate(w, l)
+        if pct is None:
+            pct_str = "--"
+        else:
+            pct_str = f"{pct:.0f}%"
+
+        lines.append(f"{meta['title']}: {w}/{t} ({pct_str})")
 
     lines.append("")
-    lines.append("Results (today):")
-    lines.append(f"✅ Wins: {int(stats.get('wins', 0))}")
-    lines.append(f"❌ Losses: {int(stats.get('losses', 0))}")
-    lines.append(f"⏳ Pending: {int(stats.get('pending', 0))}")
+    lines.append("Results (All alerts):")
+    lines.append(f"✅ Wins: {int(overall.get('win', 0))}")
+    lines.append(f"❌ Losses: {int(overall.get('lose', 0))}")
+    lines.append(f"⏳ Pending: {int(overall.get('pending', 0))}")
 
-    win = int(stats.get("wins", 0))
-    lose = int(stats.get("losses", 0))
-    denom = win + lose
-    if denom > 0:
-        winrate = (win / denom) * 100.0
-        lines.append(f"🎯 Winrate: {winrate:.1f}%")
+    overall_pct = format_win_rate(int(overall.get("win", 0)), int(overall.get("lose", 0)))
+    if overall_pct is not None:
+        lines.append("")
+        lines.append(f"🎯 Winrate: {overall_pct:.0f}%")
 
     msg = "\n".join(lines)
     if send_telegram(msg):
@@ -781,7 +793,7 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
 
 def main():
     ensure_data_dir()
-    print("Live Alert Engine v7 Started (GOAL_1H settles at HT, others at FT + Daily Report)")
+    print("Live Alert Engine v8 Started (Daily Report Win/Total per alert)")
     validate_env()
 
     load_sent_alerts()
