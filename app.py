@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import re
 import requests
 
 API_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
@@ -9,45 +11,62 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 API_BASE = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 
-ALLOWED_LEAGUES = {
-    39,   # England - Premier League
-    40,   # England - Championship
-    41,   # England - League One
-    42,   # England - League Two
-    45,   # England - FA Cup
-    140,  # Spain - La Liga
-    141,  # Spain - Segunda División
-    143,  # Spain - Copa del Rey
-    135,  # Italy - Serie A
-    136,  # Italy - Serie B
-    137,  # Italy - Coppa Italia
-    61,   # France - Ligue 1
-    62,   # France - Ligue 2
-    66,   # France - Coupe de France
-    78,   # Germany - Bundesliga
-    88,   # Netherlands - Eredivisie
-    96,   # Netherlands - KNVB Beker
-    94,   # Portugal - Primeira Liga
-    203,  # Turkey - Süper Lig
-    204,  # Turkey - 1. Lig
-    179,  # Scotland - Premiership
-    207,  # Switzerland - Super League
-    210,  # Greece - Super League 1
-    218,  # Czech Liga
-    119,  # Poland - Ekstraklasa
-    271,  # Romania - Liga I
-    197,  # Croatia - HNL
-    286,  # Serbia - Super Liga
-    253,  # USA - Major League Soccer
-}
-
-SENT_ALERTS = set()
+# Mapping cache file (stored in repo container filesystem; resets if container rebuilds)
+LEAGUE_CACHE_FILE = "league_cache.json"
+LEAGUE_CACHE_TTL_SEC = 24 * 60 * 60  # 24h
 
 # Stats cache: fixture_id -> {"home": int, "away": int, "ts": float}
 STATS_CACHE = {}
+STATS_COOLDOWN_SEC = 60  # 1 minute cooldown (as requested)
 
-# Cooldown for stats per fixture (seconds)
-STATS_COOLDOWN_SEC = 60
+# In-memory anti-duplicate: fixture_id|alert_code
+SENT_ALERTS = set()
+
+# Your premium whitelist (Country + League Name) exactly as your project memory
+# The engine will resolve these into stable league IDs.
+ALLOWED_LEAGUE_KEYS = [
+    ("Egypt", "Premier League"),
+    ("USA", "Major League Soccer"),
+    ("Belgium", "Jupiler Pro League"),
+    ("Spain", "La Liga"),
+    ("Netherlands", "Eredivisie"),
+    ("France", "Ligue 1"),
+    ("Spain", "Segunda División"),
+    ("Argentina", "Liga Profesional Argentina"),
+    ("Portugal", "Primeira Liga"),
+    ("Chile", "Primera División"),
+    ("Colombia", "Primera A"),
+    ("Paraguay", "Division Profesional - Apertura"),
+    ("Ecuador", "Liga Pro"),
+    ("Switzerland", "Super League"),
+    ("Turkey", "Süper Lig"),
+    ("Turkey", "1. Lig"),
+    ("South-Africa", "Premier Soccer League"),
+    ("Romania", "Liga I"),
+    ("Poland", "Ekstraklasa"),
+    ("India", "Indian Super League"),
+    ("Croatia", "HNL"),
+    ("Italy", "Serie B"),
+    ("Italy", "Serie A"),
+    ("Greece", "Super League 1"),
+    ("Serbia", "Super Liga"),
+    ("Germany", "Bundesliga"),
+    ("Czech-Republic", "Czech Liga"),
+    ("Peru", "Primera División"),
+    ("Brazil", "Carioca - 1"),
+    ("Ireland", "Premier Division"),
+    ("France", "Ligue 2"),
+    ("England", "Premier League"),
+    ("England", "Championship"),
+    ("England", "League One"),
+    ("England", "League Two"),
+    ("England", "FA Cup"),
+    ("Netherlands", "KNVB Beker"),
+    ("Scotland", "Premiership"),
+    ("France", "Coupe de France"),
+    ("Italy", "Coppa Italia"),
+    ("Spain", "Copa del Rey"),
+]
 
 
 def _safe_int(v, default=0):
@@ -57,6 +76,14 @@ def _safe_int(v, default=0):
         return int(v)
     except Exception:
         return default
+
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("–", "-").replace("—", "-").replace("’", "'")
+    s = s.replace(".", "")
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
 def validate_env():
@@ -104,12 +131,10 @@ def get_live_fixtures():
 
 
 def should_fetch_stats(minute: int, status_short: str) -> bool:
-    # Fetch stats only when the match is in a relevant window or at HT.
     if status_short == "HT":
         return True
     if minute < 0:
         return False
-
     if 20 <= minute <= 30:
         return True
     if 50 <= minute <= 70:
@@ -118,27 +143,23 @@ def should_fetch_stats(minute: int, status_short: str) -> bool:
         return True
     if 85 <= minute <= 88:
         return True
-
     return False
 
 
 def get_sot_cached(fixture_id: int):
     now = time.time()
     cached = STATS_CACHE.get(fixture_id)
-
     if cached and (now - cached["ts"] < STATS_COOLDOWN_SEC):
         return cached["home"], cached["away"]
 
     url = f"{API_BASE}/fixtures/statistics?fixture={fixture_id}"
-
     try:
         r = requests.get(url, headers=HEADERS, timeout=25)
         data = r.json()
         resp = data.get("response", [])
 
-        if not isinstance(resp, list) or len(resp) < 2:
-            home_sot, away_sot = 0, 0
-        else:
+        home_sot, away_sot = 0, 0
+        if isinstance(resp, list) and len(resp) >= 2:
             def extract_sot(team_block):
                 for item in team_block.get("statistics", []):
                     if item.get("type") == "Shots on Target":
@@ -152,7 +173,6 @@ def get_sot_cached(fixture_id: int):
         return home_sot, away_sot
 
     except Exception as ex:
-        # If the API fails, return cached values if available; otherwise zeros.
         if cached:
             return cached["home"], cached["away"]
         print(f"Stats request failed for fixture {fixture_id}: {ex}")
@@ -167,7 +187,67 @@ def already_sent(fixture_id: int, alert_code: str) -> bool:
     return False
 
 
-def check_alerts_for_match(match: dict):
+def load_league_cache():
+    try:
+        with open(LEAGUE_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_league_cache(payload: dict):
+    try:
+        with open(LEAGUE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as ex:
+        print(f"Failed to save league cache: {ex}")
+
+
+def resolve_allowed_league_ids():
+    desired = set((_norm(c), _norm(n)) for (c, n) in ALLOWED_LEAGUE_KEYS)
+
+    cache = load_league_cache()
+    now = int(time.time())
+
+    if cache and isinstance(cache, dict):
+        ts = _safe_int(cache.get("ts"), 0)
+        ids = cache.get("ids", [])
+        if ts > 0 and (now - ts) < LEAGUE_CACHE_TTL_SEC and isinstance(ids, list) and ids:
+            allowed_ids = set(_safe_int(x, 0) for x in ids if _safe_int(x, 0) > 0)
+            print(f"Loaded {len(allowed_ids)} league IDs from cache.")
+            return allowed_ids
+
+    print("Resolving league IDs from API (cache miss/expired)...")
+
+    url = f"{API_BASE}/leagues"
+    allowed_ids = set()
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        data = r.json()
+        resp = data.get("response", [])
+
+        for item in resp:
+            league = item.get("league", {}) or {}
+            country = item.get("country", {}) or {}
+
+            league_id = _safe_int(league.get("id"), 0)
+            league_name = _norm(league.get("name") or "")
+            country_name = _norm(country.get("name") or "")
+
+            if league_id > 0 and (country_name, league_name) in desired:
+                allowed_ids.add(league_id)
+
+        save_league_cache({"ts": now, "ids": sorted(list(allowed_ids))})
+        print(f"Resolved and cached {len(allowed_ids)} league IDs.")
+        return allowed_ids
+
+    except Exception as ex:
+        print(f"League resolve failed: {ex}")
+        return allowed_ids
+
+
+def check_alerts_for_match(match: dict, allowed_league_ids: set):
     fixture = match.get("fixture", {}) or {}
     league = match.get("league", {}) or {}
     teams = match.get("teams", {}) or {}
@@ -178,15 +258,13 @@ def check_alerts_for_match(match: dict):
         return
 
     league_id = _safe_int(league.get("id"), 0)
-    if league_id not in ALLOWED_LEAGUES:
+    if league_id not in allowed_league_ids:
         return
 
     status = fixture.get("status", {}) or {}
     status_short = (status.get("short") or "").strip().upper()
-
     minute = _safe_int(status.get("elapsed"), -1)
 
-    # Skip matches that are not in relevant windows and not HT.
     if not should_fetch_stats(minute, status_short):
         return
 
@@ -200,7 +278,6 @@ def check_alerts_for_match(match: dict):
     home_sot, away_sot = get_sot_cached(fixture_id)
     sot_total = home_sot + away_sot
 
-    # Alert 1: GOAL 1H
     if 20 <= minute <= 30 and score == "0 - 0" and sot_total >= 3:
         if not already_sent(fixture_id, "GOAL_1H"):
             msg = (
@@ -211,7 +288,6 @@ def check_alerts_for_match(match: dict):
             )
             send_telegram(msg)
 
-    # Alert 2: 2 GOALS 2H (HT exact)
     if status_short == "HT" and score == "0 - 0" and sot_total >= 5:
         if not already_sent(fixture_id, "TWO_GOALS_2H"):
             msg = (
@@ -222,7 +298,6 @@ def check_alerts_for_match(match: dict):
             )
             send_telegram(msg)
 
-    # Alert 3: OVER 2.5 GOALS (HT exact)
     if status_short == "HT" and score in ("1 - 0", "0 - 1") and sot_total >= 4:
         if not already_sent(fixture_id, "OVER_2_5_GOALS"):
             msg = (
@@ -233,7 +308,6 @@ def check_alerts_for_match(match: dict):
             )
             send_telegram(msg)
 
-    # Alert 4: GOAL PUSH 2H
     if 50 <= minute <= 70 and score == "1 - 1" and sot_total >= 6:
         if not already_sent(fixture_id, "GOAL_PUSH_2H"):
             msg = (
@@ -244,7 +318,6 @@ def check_alerts_for_match(match: dict):
             )
             send_telegram(msg)
 
-    # Alert 5: LATE GOAL
     if 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
         if not already_sent(fixture_id, "LATE_GOAL"):
             msg = (
@@ -255,7 +328,6 @@ def check_alerts_for_match(match: dict):
             )
             send_telegram(msg)
 
-    # Alert 6: LAST MINUTE GOAL
     if 85 <= minute <= 88 and sot_total >= 10:
         if not already_sent(fixture_id, "LAST_MINUTE_GOAL"):
             msg = (
@@ -268,18 +340,19 @@ def check_alerts_for_match(match: dict):
 
 
 def main():
-    print("Live Alert Engine v3 Started (Relevant windows + 60s stats cooldown)")
+    print("Live Alert Engine Premium Started (IDs resolved + relevant windows + 60s stats cooldown)")
     validate_env()
+
+    allowed_league_ids = resolve_allowed_league_ids()
+    print(f"Allowed league IDs active: {len(allowed_league_ids)}")
 
     while True:
         matches = get_live_fixtures()
-
         for m in matches:
             try:
-                check_alerts_for_match(m)
+                check_alerts_for_match(m, allowed_league_ids)
             except Exception as ex:
                 print(f"Alert check error: {ex}")
-
         time.sleep(60)
 
 
