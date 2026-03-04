@@ -122,8 +122,6 @@ def send_telegram(message: str) -> bool:
         ok = (resp.status_code == 200)
         if not ok:
             print(f"Telegram send failed: {resp.status_code} {resp.text[:300]}")
-        else:
-            print("Telegram test message sent successfully.")
         return ok
     except Exception as ex:
         print(f"Telegram send exception: {ex}")
@@ -409,14 +407,8 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
 
 def main():
     ensure_data_dir()
-    print("Live Alert Engine v5-test Started (Startup Telegram test enabled)")
+    print("Live Alert Engine v5 Started (Premium Telegram format)")
     validate_env()
-
-    send_telegram(
-        "✅ Live Alert Engine is running on Railway.\n"
-        "Startup test message.\n"
-        "If you received this, Telegram delivery is OK."
-    )
 
     load_sent_alerts()
     allowed_league_ids = resolve_allowed_league_ids()
