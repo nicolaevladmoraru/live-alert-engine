@@ -10,9 +10,6 @@ try:
 except Exception:
     ZoneInfo = None
 
-# =============================
-# Environment
-# =============================
 API_KEY = (os.getenv("API_FOOTBALL_KEY") or "").strip()
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
@@ -28,22 +25,20 @@ DAILY_STATS_FILE = os.path.join(DATA_DIR, "daily_stats.json")
 
 LEAGUE_CACHE_TTL_SEC = 24 * 60 * 60
 
-# Full tracking settings
 TRACK_START_MINUTE = 18
-STATS_MIN_INTERVAL_SEC = 60  # one stats request per fixture per minute (guard)
+STATS_MIN_INTERVAL_SEC = 60
 
-# Settlement checks
 HT_CHECK_COOLDOWN_SEC = 60
 FINISH_CHECK_COOLDOWN_SEC = 300
 
-# Daily report schedule
 REPORT_TZ = os.getenv("REPORT_TZ", "Europe/London").strip() or "Europe/London"
 REPORT_HOUR = int((os.getenv("REPORT_HOUR") or "22").strip())
 REPORT_MINUTE = int((os.getenv("REPORT_MINUTE") or "0").strip())
 
-# =============================
-# Leagues (ONLY from your memory)
-# =============================
+SENT_ALERTS = set()
+TRACKED_MATCHES = {}
+STATS_CACHE = {}
+
 ALLOWED_LEAGUE_KEYS = [
     ("Egypt", "Premier League"),
     ("USA", "Major League Soccer"),
@@ -71,6 +66,7 @@ ALLOWED_LEAGUE_KEYS = [
     ("Greece", "Super League 1"),
     ("Serbia", "Super Liga"),
     ("Germany", "Bundesliga"),
+    ("Germany", "2. Bundesliga"),
     ("Czech-Republic", "Czech Liga"),
     ("Peru", "Primera División"),
     ("Brazil", "Carioca - 1"),
@@ -82,11 +78,13 @@ ALLOWED_LEAGUE_KEYS = [
     ("England", "League Two"),
     ("England", "FA Cup"),
     ("Netherlands", "KNVB Beker"),
+    ("Netherlands", "Eerste Divisie"),
     ("Scotland", "Premiership"),
     ("France", "Coupe de France"),
     ("Italy", "Coppa Italia"),
     ("Spain", "Copa del Rey"),
     ("Saudi-Arabia", "Pro League"),
+    ("Hungary", "NB I"),
 ]
 
 ALERT_META = {
@@ -98,16 +96,7 @@ ALERT_META = {
     "LAST_MINUTE_GOAL": {"title": "🟣 LAST MINUTE GOAL", "pick": "Goal (Last Minutes)"},
 }
 
-# =============================
-# Runtime state
-# =============================
-SENT_ALERTS = set()
-TRACKED_MATCHES = {}   # fixture_id -> {"started": bool, "last_stats_ts": int}
-STATS_CACHE = {}       # fixture_id -> {"home": int, "away": int, "ts": float}
 
-# =============================
-# Helpers
-# =============================
 def _safe_int(v, default=0):
     try:
         if v is None:
@@ -116,6 +105,7 @@ def _safe_int(v, default=0):
     except Exception:
         return default
 
+
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("–", "-").replace("—", "-").replace("’", "'")
@@ -123,11 +113,13 @@ def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
+
 def ensure_data_dir():
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
     except Exception as ex:
         print(f"Failed to create data dir '{DATA_DIR}': {ex}")
+
 
 def load_json_file(path: str):
     try:
@@ -136,12 +128,14 @@ def load_json_file(path: str):
     except Exception:
         return None
 
+
 def save_json_file(path: str, payload):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as ex:
         print(f"Failed to save file '{path}': {ex}")
+
 
 def now_local():
     if ZoneInfo is None:
@@ -151,8 +145,10 @@ def now_local():
     except Exception:
         return datetime.utcnow()
 
+
 def today_key():
     return now_local().date().isoformat()
+
 
 def validate_env():
     missing = []
@@ -168,16 +164,18 @@ def validate_env():
     else:
         print("All required environment variables are set.")
 
-# =============================
-# Telegram (safe: mark sent only on success)
-# =============================
+
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram variables missing (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID).")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True
+    }
 
     try:
         resp = requests.post(url, data=payload, timeout=15)
@@ -189,6 +187,7 @@ def send_telegram(message: str) -> bool:
         print(f"Telegram send exception: {ex}")
         return False
 
+
 def load_sent_alerts():
     global SENT_ALERTS
     payload = load_json_file(SENT_ALERTS_FILE)
@@ -198,11 +197,14 @@ def load_sent_alerts():
     else:
         print("No sent alerts file found; starting fresh.")
 
+
 def persist_sent_alerts():
     save_json_file(SENT_ALERTS_FILE, sorted(list(SENT_ALERTS)))
 
+
 def is_already_sent(fixture_id: int, alert_code: str) -> bool:
     return f"{fixture_id}|{alert_code}" in SENT_ALERTS
+
 
 def mark_sent_success(fixture_id: int, alert_code: str):
     key = f"{fixture_id}|{alert_code}"
@@ -210,9 +212,7 @@ def mark_sent_success(fixture_id: int, alert_code: str):
         SENT_ALERTS.add(key)
         persist_sent_alerts()
 
-# =============================
-# API calls
-# =============================
+
 def get_live_fixtures():
     url = f"{API_BASE}/fixtures?live=all"
     try:
@@ -222,6 +222,7 @@ def get_live_fixtures():
     except Exception as ex:
         print(f"Live fixtures request failed: {ex}")
         return []
+
 
 def get_fixture_by_id(fixture_id: int):
     url = f"{API_BASE}/fixtures?id={fixture_id}"
@@ -235,6 +236,7 @@ def get_fixture_by_id(fixture_id: int):
     except Exception as ex:
         print(f"Fixture lookup failed for {fixture_id}: {ex}")
         return None
+
 
 def get_stats_sot(fixture_id: int):
     url = f"{API_BASE}/fixtures/statistics?fixture={fixture_id}"
@@ -259,6 +261,7 @@ def get_stats_sot(fixture_id: int):
         print(f"Stats request failed for fixture {fixture_id}: {ex}")
         return 0, 0
 
+
 def get_sot_cached(fixture_id: int):
     now_ts = time.time()
     cached = STATS_CACHE.get(fixture_id)
@@ -269,9 +272,7 @@ def get_sot_cached(fixture_id: int):
     STATS_CACHE[fixture_id] = {"home": h, "away": a, "ts": now_ts}
     return h, a
 
-# =============================
-# League ID whitelist (cached on disk)
-# =============================
+
 def resolve_allowed_league_ids():
     desired = set((_norm(c), _norm(n)) for (c, n) in ALLOWED_LEAGUE_KEYS)
 
@@ -314,9 +315,7 @@ def resolve_allowed_league_ids():
         print(f"League resolve failed: {ex}")
         return allowed_ids
 
-# =============================
-# Alert formatting
-# =============================
+
 def build_premium_message(alert_title: str, league_name: str, country: str, home: str, away: str,
                          minute: int, status_short: str, score: str, sot_home: int, sot_away: int,
                          pick_text: str) -> str:
@@ -343,9 +342,7 @@ def build_premium_message(alert_title: str, league_name: str, country: str, home
         f"📊 Pick:\n{pick_text}"
     )
 
-# =============================
-# Alert log + daily report stats
-# =============================
+
 def load_alert_log():
     payload = load_json_file(ALERT_LOG_FILE)
     if isinstance(payload, dict):
@@ -354,8 +351,10 @@ def load_alert_log():
         return payload
     return {"alerts": {}}
 
+
 def save_alert_log(log_data: dict):
     save_json_file(ALERT_LOG_FILE, log_data)
+
 
 def load_daily_stats():
     payload = load_json_file(DAILY_STATS_FILE)
@@ -363,8 +362,10 @@ def load_daily_stats():
         return payload
     return {"date": today_key(), "matches_scanned": 0, "report_sent_date": ""}
 
+
 def save_daily_stats(stats: dict):
     save_json_file(DAILY_STATS_FILE, stats)
+
 
 def reset_daily_stats_if_needed(stats: dict):
     tk = today_key()
@@ -373,6 +374,7 @@ def reset_daily_stats_if_needed(stats: dict):
         stats["matches_scanned"] = 0
         stats["report_sent_date"] = ""
         save_daily_stats(stats)
+
 
 def parse_score(score_str: str):
     try:
@@ -383,6 +385,7 @@ def parse_score(score_str: str):
         return _safe_int(left.strip(), 0), _safe_int(right.strip(), 0)
     except Exception:
         return 0, 0
+
 
 def register_alert_send(alert_code: str, fixture_id: int, minute: int, status_short: str,
                         score_str: str, league_name: str, country: str, home: str, away: str):
@@ -415,99 +418,7 @@ def register_alert_send(alert_code: str, fixture_id: int, minute: int, status_sh
     log_data["alerts"] = alerts
     save_alert_log(log_data)
 
-def format_win_rate(win: int, lose: int):
-    denom = win + lose
-    if denom <= 0:
-        return None
-    return (win / denom) * 100.0
 
-def compute_today_breakdown_from_log():
-    log_data = load_alert_log()
-    alerts = log_data.get("alerts", {})
-    today_str = today_key()
-
-    per_code = {code: {"total": 0, "win": 0, "lose": 0, "pending": 0} for code in ALERT_META.keys()}
-    overall = {"win": 0, "lose": 0, "pending": 0, "total": 0}
-
-    if not isinstance(alerts, dict):
-        return per_code, overall
-
-    for a in alerts.values():
-        if not isinstance(a, dict):
-            continue
-        if a.get("sent_date") != today_str:
-            continue
-
-        code = a.get("alert_code")
-        if code not in per_code:
-            continue
-
-        per_code[code]["total"] += 1
-        overall["total"] += 1
-
-        res = (a.get("result") or "PENDING").upper()
-        if a.get("resolved") is True and res == "WIN":
-            per_code[code]["win"] += 1
-            overall["win"] += 1
-        elif a.get("resolved") is True and res == "LOSE":
-            per_code[code]["lose"] += 1
-            overall["lose"] += 1
-        else:
-            per_code[code]["pending"] += 1
-            overall["pending"] += 1
-
-    return per_code, overall
-
-def maybe_send_daily_report():
-    stats = load_daily_stats()
-    reset_daily_stats_if_needed(stats)
-
-    now_dt = now_local()
-    if now_dt.hour != REPORT_HOUR or now_dt.minute != REPORT_MINUTE:
-        return
-
-    today_str = today_key()
-    if stats.get("report_sent_date") == today_str:
-        return
-
-    per_code, overall = compute_today_breakdown_from_log()
-
-    lines = []
-    lines.append("📊 DAILY REPORT")
-    lines.append("")
-    lines.append(f"Date: {today_str}")
-    lines.append(f"Matches scanned: {int(stats.get('matches_scanned', 0))}")
-    lines.append(f"Alerts sent: {int(overall.get('total', 0))}")
-    lines.append("")
-    lines.append("Alerts breakdown (Win/Total):")
-
-    for code, meta in ALERT_META.items():
-        w = int(per_code[code]["win"])
-        l = int(per_code[code]["lose"])
-        t = int(per_code[code]["total"])
-        pct = format_win_rate(w, l)
-        pct_str = "--" if pct is None else f"{pct:.0f}%"
-        lines.append(f"{meta['title']}: {w}/{t} ({pct_str})")
-
-    lines.append("")
-    lines.append("Results (All alerts):")
-    lines.append(f"✅ Wins: {int(overall.get('win', 0))}")
-    lines.append(f"❌ Losses: {int(overall.get('lose', 0))}")
-    lines.append(f"⏳ Pending: {int(overall.get('pending', 0))}")
-
-    overall_pct = format_win_rate(int(overall.get("win", 0)), int(overall.get("lose", 0)))
-    if overall_pct is not None:
-        lines.append("")
-        lines.append(f"🎯 Winrate: {overall_pct:.0f}%")
-
-    msg = "\n".join(lines)
-    if send_telegram(msg):
-        stats["report_sent_date"] = today_str
-        save_daily_stats(stats)
-
-# =============================
-# Settlement logic (kept even if stats tracking stops at ET)
-# =============================
 def evaluate_alert_outcome_ft(alert: dict, fixture_obj: dict):
     fixture = fixture_obj.get("fixture", {}) or {}
     status = fixture.get("status", {}) or {}
@@ -545,6 +456,7 @@ def evaluate_alert_outcome_ft(alert: dict, fixture_obj: dict):
         return "WIN" if ft_total > base_total else "LOSE"
 
     return None
+
 
 def resolve_goal1h_at_ht_if_possible():
     log_data = load_alert_log()
@@ -598,6 +510,7 @@ def resolve_goal1h_at_ht_if_possible():
         log_data["alerts"] = alerts
         save_alert_log(log_data)
 
+
 def resolve_other_alerts_at_ft():
     log_data = load_alert_log()
     alerts = log_data.get("alerts", {})
@@ -641,21 +554,108 @@ def resolve_other_alerts_at_ft():
         log_data["alerts"] = alerts
         save_alert_log(log_data)
 
-# =============================
-# Tracking rule (your requirement)
-# Full stats tracking from minute >= 18 until end of regular time.
-# Stop stats requests if match goes to ET/PEN, but keep settlement checks.
-# =============================
+
+def format_win_rate(win: int, lose: int):
+    denom = win + lose
+    if denom <= 0:
+        return None
+    return (win / denom) * 100.0
+
+
+def compute_today_breakdown_from_log():
+    log_data = load_alert_log()
+    alerts = log_data.get("alerts", {})
+    today_str = today_key()
+
+    per_code = {code: {"total": 0, "win": 0, "lose": 0, "pending": 0} for code in ALERT_META.keys()}
+    overall = {"win": 0, "lose": 0, "pending": 0, "total": 0}
+
+    if not isinstance(alerts, dict):
+        return per_code, overall
+
+    for a in alerts.values():
+        if not isinstance(a, dict):
+            continue
+        if a.get("sent_date") != today_str:
+            continue
+
+        code = a.get("alert_code")
+        if code not in per_code:
+            continue
+
+        per_code[code]["total"] += 1
+        overall["total"] += 1
+
+        res = (a.get("result") or "PENDING").upper()
+        if a.get("resolved") is True and res == "WIN":
+            per_code[code]["win"] += 1
+            overall["win"] += 1
+        elif a.get("resolved") is True and res == "LOSE":
+            per_code[code]["lose"] += 1
+            overall["lose"] += 1
+        else:
+            per_code[code]["pending"] += 1
+            overall["pending"] += 1
+
+    return per_code, overall
+
+
+def maybe_send_daily_report():
+    stats = load_daily_stats()
+    reset_daily_stats_if_needed(stats)
+
+    now_dt = now_local()
+    if now_dt.hour != REPORT_HOUR or now_dt.minute != REPORT_MINUTE:
+        return
+
+    today_str = today_key()
+    if stats.get("report_sent_date") == today_str:
+        return
+
+    per_code, overall = compute_today_breakdown_from_log()
+
+    lines = []
+    lines.append("📊 DAILY REPORT")
+    lines.append("")
+    lines.append(f"Date: {today_str}")
+    lines.append(f"Matches scanned: {int(stats.get('matches_scanned', 0))}")
+    lines.append(f"Alerts sent: {int(overall.get('total', 0))}")
+    lines.append("")
+    lines.append("Alerts breakdown (Win/Total):")
+
+    for code, meta in ALERT_META.items():
+        w = int(per_code[code]["win"])
+        l = int(per_code[code]["lose"])
+        t = int(per_code[code]["total"])
+        pct = format_win_rate(w, l)
+        pct_str = "--" if pct is None else f"{pct:.0f}%"
+        lines.append(f"{meta['title']}: {w}/{t} ({pct_str})")
+
+    lines.append("")
+    lines.append("Results (All alerts):")
+    lines.append(f"✅ Wins: {int(overall.get('win', 0))}")
+    lines.append(f"❌ Losses: {int(overall.get('lose', 0))}")
+    lines.append(f"⏳ Pending: {int(overall.get('pending', 0))}")
+
+    overall_pct = format_win_rate(int(overall.get("win", 0)), int(overall.get("lose", 0)))
+    if overall_pct is not None:
+        lines.append("")
+        lines.append(f"🎯 Winrate: {overall_pct:.0f}%")
+
+    msg = "\n".join(lines)
+    if send_telegram(msg):
+        stats["report_sent_date"] = today_str
+        save_daily_stats(stats)
+
+
 def is_regular_time_status(status_short: str) -> bool:
     return status_short in ("1H", "HT", "2H")
 
+
 def should_stop_stats_tracking(status_short: str) -> bool:
-    # Stop stats tracking once match leaves regular time (extra time / penalties / finished)
     return status_short in ("ET", "AET", "PEN", "P", "BT", "FT")
 
-# =============================
-# Alert rules
-# =============================
+
 def check_alerts_for_match(match: dict, allowed_league_ids: set):
     fixture = match.get("fixture", {}) or {}
     league = match.get("league", {}) or {}
@@ -674,31 +674,28 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
     status_short = (status.get("short") or "").strip().upper()
     minute = _safe_int(status.get("elapsed"), -1)
 
-    # Initialize tracked state
     if fixture_id not in TRACKED_MATCHES:
         TRACKED_MATCHES[fixture_id] = {"started": False, "last_stats_ts": 0, "stats_enabled": True}
 
-    # Stop stats tracking if match goes to ET/PEN/FT (per your requirement)
     if should_stop_stats_tracking(status_short):
         TRACKED_MATCHES[fixture_id]["stats_enabled"] = False
         return
 
-    # Start tracking at minute >= 18 (only during regular time statuses)
-    if (minute >= TRACK_START_MINUTE) and is_regular_time_status(status_short):
+    if minute >= TRACK_START_MINUTE and is_regular_time_status(status_short):
         TRACKED_MATCHES[fixture_id]["started"] = True
 
     if not TRACKED_MATCHES[fixture_id]["started"]:
         return
 
-    # Only do stats requests during regular time, and only if enabled
     if not TRACKED_MATCHES[fixture_id]["stats_enabled"]:
         return
+
     if not is_regular_time_status(status_short):
         return
 
-    # Guard: max 1 stats request per fixture per minute
     now_ts = int(time.time())
     last_stats_ts = _safe_int(TRACKED_MATCHES[fixture_id].get("last_stats_ts"), 0)
+
     if last_stats_ts > 0 and (now_ts - last_stats_ts) < STATS_MIN_INTERVAL_SEC:
         h_sot = _safe_int(STATS_CACHE.get(fixture_id, {}).get("home"), 0)
         a_sot = _safe_int(STATS_CACHE.get(fixture_id, {}).get("away"), 0)
@@ -718,7 +715,6 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
     league_name = (league.get("name") or "").strip()
     country = (league.get("country") or "").strip()
 
-    # GOAL 1H (back to 20-30 as you requested)
     if 20 <= minute <= 30 and score_str == "0 - 0" and sot_total >= 3:
         code = "GOAL_1H"
         if not is_already_sent(fixture_id, code):
@@ -731,7 +727,6 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
                 mark_sent_success(fixture_id, code)
                 register_alert_send(code, fixture_id, minute, status_short, score_str, league_name, country, home_name, away_name)
 
-    # 2 GOALS 2H (HT)
     if status_short == "HT" and score_str == "0 - 0" and sot_total >= 5:
         code = "TWO_GOALS_2H"
         if not is_already_sent(fixture_id, code):
@@ -744,7 +739,6 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
                 mark_sent_success(fixture_id, code)
                 register_alert_send(code, fixture_id, minute, status_short, score_str, league_name, country, home_name, away_name)
 
-    # OVER 2.5 GOALS (HT)
     if status_short == "HT" and score_str in ("1 - 0", "0 - 1") and sot_total >= 4:
         code = "OVER_2_5_GOALS"
         if not is_already_sent(fixture_id, code):
@@ -757,7 +751,6 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
                 mark_sent_success(fixture_id, code)
                 register_alert_send(code, fixture_id, minute, status_short, score_str, league_name, country, home_name, away_name)
 
-    # GOAL PUSH 2H
     if 50 <= minute <= 70 and score_str == "1 - 1" and sot_total >= 6:
         code = "GOAL_PUSH_2H"
         if not is_already_sent(fixture_id, code):
@@ -770,7 +763,6 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
                 mark_sent_success(fixture_id, code)
                 register_alert_send(code, fixture_id, minute, status_short, score_str, league_name, country, home_name, away_name)
 
-    # LATE GOAL
     if 70 <= minute <= 85 and abs(home_goals - away_goals) == 1 and sot_total >= 8:
         code = "LATE_GOAL"
         if not is_already_sent(fixture_id, code):
@@ -783,7 +775,6 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
                 mark_sent_success(fixture_id, code)
                 register_alert_send(code, fixture_id, minute, status_short, score_str, league_name, country, home_name, away_name)
 
-    # LAST MINUTE GOAL
     if 85 <= minute <= 88 and sot_total >= 10:
         code = "LAST_MINUTE_GOAL"
         if not is_already_sent(fixture_id, code):
@@ -796,20 +787,16 @@ def check_alerts_for_match(match: dict, allowed_league_ids: set):
                 mark_sent_success(fixture_id, code)
                 register_alert_send(code, fixture_id, minute, status_short, score_str, league_name, country, home_name, away_name)
 
-# =============================
-# Loop timing
-# =============================
+
 def sleep_to_next_minute():
     now_ts = time.time()
     next_minute = (int(now_ts // 60) + 1) * 60
     time.sleep(max(0.0, next_minute - now_ts))
 
-# =============================
-# Main
-# =============================
+
 def main():
     ensure_data_dir()
-    print("Live Alert Engine v11 Started (Full tracking 18->end regular time + Daily Report + Telegram safe)")
+    print("Live Alert Engine v11 Started (45 memory leagues)")
     validate_env()
 
     load_sent_alerts()
@@ -833,7 +820,6 @@ def main():
             except Exception as ex:
                 print(f"Alert check error: {ex}")
 
-        # Settlements
         try:
             resolve_goal1h_at_ht_if_possible()
         except Exception as ex:
@@ -844,13 +830,13 @@ def main():
         except Exception as ex:
             print(f"FT settle error: {ex}")
 
-        # Daily report
         try:
             maybe_send_daily_report()
         except Exception as ex:
             print(f"Daily report error: {ex}")
 
         sleep_to_next_minute()
+
 
 if __name__ == "__main__":
     main()
